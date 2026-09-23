@@ -17,11 +17,11 @@ const manifestBytes = readFileSync(join(source, 'manifest.json'));
 const manifest = JSON.parse(manifestBytes);
 const { VERSION, CATS, MODES, renderKey } = await import('./com.teamvrotek.catattention.sdPlugin/lib/renderer.js');
 
-if (manifest.Version !== '1.0' || VERSION !== '1.0') throw new Error('Cat Companion must remain version 1.0.');
+if (manifest.Version !== '2.0' || VERSION !== '2.0') throw new Error('Cat Companion must remain version 2.0.');
 if (manifest.UUID !== uuid) throw new Error('Unexpected plugin identity.');
 if (!existsSync(cli)) throw new Error('Run npm ci before npm run build.');
 for (const path of ['package.json', `${directoryName}/package.json`]) {
-  if (JSON.parse(readFileSync(join(project, path))).version !== '1.0.0') throw new Error(`Unexpected npm version in ${path}.`);
+  if (JSON.parse(readFileSync(join(project, path))).version !== '2.0.0') throw new Error(`Unexpected npm version in ${path}.`);
 }
 
 const temporary = mkdtempSync(join(tmpdir(), 'cat-companion-build-'));
@@ -106,19 +106,19 @@ try {
     count++;
   }
   const extractedPlugin = join(extracted, directoryName);
-  for (const path of ['plugin.js', 'controller.js', 'config.js', 'session.js', 'LICENSE', 'ui/property-inspector.html', 'ui/property-inspector.css', 'ui/property-inspector.js', 'lib/renderer.js', 'lib/behavior.js', 'lib/press.js', 'lib/image-rate.js', 'lib/routine.js', 'lib/social.js', 'lib/appetite.js', 'lib/care-constants.js', 'lib/care-feedback.js', 'resources.js', 'ui/resource-inspector.html', 'ui/resource-inspector.js']) {
+  for (const path of ['plugin.js', 'controller.js', 'config.js', 'session.js', 'LICENSE', 'ui/property-inspector.html', 'ui/property-inspector.css', 'ui/property-inspector.js', 'lib/renderer.js', 'lib/behavior.js', 'lib/press.js', 'lib/image-rate.js', 'lib/routine.js', 'lib/social.js', 'lib/adventures.js', 'lib/biscuits.js', 'lib/personality.js', 'lib/appetite.js', 'lib/care-constants.js', 'lib/care-feedback.js', 'resources.js', 'ui/resource-inspector.html', 'ui/resource-inspector.js']) {
     if (!existsSync(join(extractedPlugin, path))) throw new Error(`Required runtime file missing: ${path}`);
   }
 
   run(process.execPath, ['--input-type=module', '-e', "await import('@elgato/streamdeck'); await import('./controller.js'); await import('./config.js'); await import('./session.js');"], extractedPlugin);
   const schemaPlugin = join(temporary, 'schema', directoryName);
   cpSync(extractedPlugin, schemaPlugin, { recursive: true });
-  writeFileSync(join(schemaPlugin, 'manifest.json'), JSON.stringify({ ...manifest, Version: '1.0.0.0' }, null, 2) + '\n');
+  writeFileSync(join(schemaPlugin, 'manifest.json'), JSON.stringify({ ...manifest, Version: '2.0.0.0' }, null, 2) + '\n');
   runCli(['validate', schemaPlugin, '--no-update-check']);
 
   const installer = Buffer.from(zipSync(entries, { level: 6 }));
   const shippedManifest = unzipSync(installer)[manifestEntry];
-  if (!Buffer.from(shippedManifest).equals(manifestBytes)) throw new Error('Final installer did not preserve the exact 1.0 manifest.');
+  if (!Buffer.from(shippedManifest).equals(manifestBytes)) throw new Error('Final installer did not preserve the exact 2.0 manifest.');
   if (!readFileSync(join(source, 'manifest.json')).equals(manifestBytes)) throw new Error('Source manifest changed during the build.');
   mkdirSync(release, { recursive: true });
   const output = join(release, `${uuid}.streamDeckPlugin`);
@@ -128,7 +128,7 @@ try {
   const checksum = createHash('sha256').update(installer).digest('hex');
   writeFileSync(`${output}.sha256`, `${checksum}  ${basename(output)}\n`);
   console.log(`Verified ${count} packaged files and ${CATS.length * MODES.length} cat frames.`);
-  console.log(`Built ${relative(project, output)} with exact Version 1.0.`);
+  console.log(`Built ${relative(project, output)} with exact Version 2.0.`);
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

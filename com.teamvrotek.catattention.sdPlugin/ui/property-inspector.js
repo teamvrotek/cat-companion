@@ -1,10 +1,11 @@
 import { CATS, renderButton } from '../lib/renderer.js';
 import { DEFAULT_SCHEDULE, TEMPERAMENTS, validateSchedule } from '../lib/behavior.js';
+import { OUTDOOR_OPTIONS } from '../lib/adventures.js';
 import { APPETITES, DEFAULT_APPETITE } from '../lib/appetite.js';
 
 export const ACTION_UUID = 'com.teamvrotek.catattention.cat';
-export const DEFAULT_SETTINGS = Object.freeze({ name: '', cat: 'ginger', temperament: 'chill', appetite: DEFAULT_APPETITE, schedule: DEFAULT_SCHEDULE, animate: true });
-const CONFIG_KEYS = Object.freeze(['name', 'cat', 'temperament', 'appetite', 'schedule', 'animate']);
+export const DEFAULT_SETTINGS = Object.freeze({ name: '', cat: 'ginger', temperament: 'chill', appetite: DEFAULT_APPETITE, schedule: DEFAULT_SCHEDULE, animate: true, outdoor: 'indoor' });
+const CONFIG_KEYS = Object.freeze(['name', 'cat', 'temperament', 'appetite', 'schedule', 'animate', 'outdoor']);
 const LINKS = Object.freeze({ github: 'https://github.com/teamvrotek', instagram: 'https://www.instagram.com/teamvrotek/' });
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -36,6 +37,9 @@ export function validatePatch(patch) {
     } else if (key === 'appetite') {
       if (typeof value !== 'string' || !Object.hasOwn(APPETITES, value)) throw new RangeError('Choose an available appetite.');
       output.appetite = value;
+    } else if (key === 'outdoor') {
+      if (typeof value !== 'string' || !Object.hasOwn(OUTDOOR_OPTIONS, value)) throw new RangeError('Choose an available outdoor option.');
+      output.outdoor = value;
     } else if (key === 'schedule') {
       validateSchedule(value);
       output.schedule = Object.fromEntries(['day', 'evening', 'night'].map(period => [period, value[period]]));
@@ -124,7 +128,7 @@ function initializeInspector() {
   const dirty = new Set();
   const coats = [];
   const schedules = Object.fromEntries(['day', 'evening', 'night'].map(period => [period, $(`${period}-start`)]));
-  const inputs = [$('cat-name'), $('temperament'), $('appetite'), $('animate-cat'), ...Object.values(schedules)];
+  const inputs = [$('cat-name'), $('temperament'), $('appetite'), $('outdoor'), $('animate-cat'), ...Object.values(schedules)];
   const links = [...document.querySelectorAll('[data-link]')];
   let socket = null;
   let context = '';
@@ -163,6 +167,7 @@ function initializeInspector() {
     if (!dirty.has('name') && document.activeElement !== $('cat-name') && $('cat-name').value !== settings.name) $('cat-name').value = settings.name;
     if (document.activeElement !== $('temperament')) $('temperament').value = settings.temperament;
     if (document.activeElement !== $('appetite')) $('appetite').value = settings.appetite;
+    if (document.activeElement !== $('outdoor')) $('outdoor').value = settings.outdoor;
     if (document.activeElement !== $('animate-cat')) $('animate-cat').checked = settings.animate;
     if (!dirty.has('schedule')) for (const [period, field] of Object.entries(schedules)) if (document.activeElement !== field && field.value !== settings.schedule[period]) field.value = settings.schedule[period];
     writeText($('appearance-name'), CATS.find(cat => cat.id === settings.cat)?.label || 'Cat');
@@ -197,11 +202,6 @@ function initializeInspector() {
     writeText($('preview-label'), online ? [settings.name, cat.period].filter(Boolean).join(' · ') || 'Your cat' : 'Last known state');
     writeText($('status-title'), typeof cat.label === 'string' ? cat.label : 'Your cat');
     writeText($('status-description'), online ? typeof cat.description === 'string' ? cat.description : '' : 'Stream Deck is disconnected. This state is no longer updating.');
-    const count = Math.max(1, Number(payload.companyCount) || 1);
-    writeText($('company-status'), count > 1 ? `${count} cats on this page. Company means less demand for your attention, shared play and occasional disagreements. Churu fairness is closely monitored.` : 'Add another cat on this page for company, play and occasional disagreements.');
-    const care = payload.companions || {};
-    const enabledCare = [care.food?.active ? 'Food bowl linked' : '', care.litter?.active ? 'Litter box linked' : ''].filter(Boolean);
-    writeText($('companion-status'), enabledCare.length ? `${enabledCare.join(' · ')}. Keep these keys on the same page as your cat. Needs pause when the linked keys leave the page.` : 'Add a Food bowl or Litter box key beside this cat to enable optional care. Needs pause when those keys leave the page.');
     const pets = Number.isSafeInteger(cat.attentionCount) ? cat.attentionCount : null;
     const treats = Number.isSafeInteger(cat.treatCount) ? cat.treatCount : null;
     writeText($('status-counters'), pets === null || treats === null ? '' : `${pets} ${pets === 1 ? 'pet' : 'pets'} · ${treats} ${treats === 1 ? 'treat' : 'treats'}`);
@@ -237,6 +237,7 @@ function initializeInspector() {
     button.addEventListener('click', () => stage({ cat: cat.id })); $('coat-picker').append(button); coats.push({ id: cat.id, button });
   }
   for (const temperament of Object.values(TEMPERAMENTS)) $('temperament').add(new Option(temperament.label, temperament.id));
+  for (const [id, label] of Object.entries(OUTDOOR_OPTIONS)) $('outdoor').add(new Option(label, id));
   for (const appetite of Object.values(APPETITES)) $('appetite').add(new Option(appetite.label, appetite.id));
   $('cat-name').addEventListener('input', () => { dirty.add('name'); stage({ name: $('cat-name').value }); });
   $('cat-name').addEventListener('blur', () => { $('cat-name').value = normalizeName($('cat-name').value); dirty.delete('name'); render(); });
@@ -244,6 +245,8 @@ function initializeInspector() {
   $('temperament').addEventListener('blur', () => render());
   $('appetite').addEventListener('change', () => stage({ appetite: $('appetite').value }));
   $('appetite').addEventListener('blur', () => render());
+  $('outdoor').addEventListener('change', () => stage({ outdoor: $('outdoor').value }));
+  $('outdoor').addEventListener('blur', () => render());
   $('animate-cat').addEventListener('change', () => stage({ animate: $('animate-cat').checked }));
   $('animate-cat').addEventListener('blur', () => render());
   for (const field of Object.values(schedules)) { field.addEventListener('input', () => dirty.add('schedule')); field.addEventListener('change', commitSchedule); field.addEventListener('blur', () => { if (!dirty.has('schedule')) render(); }); }

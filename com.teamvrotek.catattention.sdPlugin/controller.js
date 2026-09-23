@@ -2,15 +2,31 @@ import { ACTION_UUID, SAVE_INTERVAL_MS } from './config.js';
 import { createSession } from './session.js';
 import { createPressController } from './lib/press.js';
 import { queueKeyImage, cancelKeyImage, KEY_IMAGE_INTERVAL_MS } from './lib/image-rate.js';
-import { MODES, renderButton } from './lib/renderer.js';
+import { MODES, renderButton, createButtonRenderer } from './lib/renderer.js';
 import { registerResources } from './resources.js';
 import { createSocial, restoreSocial, serializeSocial, advanceSocial, companyAttentionScale, socialPlayReady,
-  startSocialPair, cancelSocialPair, recordSocialTreat, socialFrame, SOCIAL_PLAY_ATTENTION_RELIEF } from './lib/social.js';
+  startSocialPair, socialPartnerScore, cancelSocialPair, recordSocialTreat, socialFrame, SOCIAL_PLAY_ATTENTION_RELIEF } from './lib/social.js';
 
 const TICK_MS = KEY_IMAGE_INTERVAL_MS;
 const STALE_PRESS_MS = 2_000;
 const HIDDEN_CACHE_LIMIT = 128;
 const DESCRIPTIONS = Object.freeze({
+  watching: 'Something very important might move.',
+  stretching: 'A full-body stretch. No hurry.',
+  stalking: 'The hunt is mostly imaginary.',
+  greeting: 'A familiar face. A little hello.',
+  'grooming-together': 'You missed a spot.',
+  'resting-together': 'Quiet company.',
+  biscuits: 'Making biscuits. Very serious paw work.',
+  mischief: 'A little nudge, a very long stare, perhaps a paw wash. The object is getting closer to the edge.',
+  'mischief-sulk': 'You stopped the fun before it really began. This cat is sulking.',
+  disappointed: 'You caught it. An impressive save and a deeply disappointed cat.',
+  'food-sulk': 'No place at dinner. Add another shared bowl for every four cats, or give this cat its own bowl.',
+  saved: 'Caught it! The object survives. The cat has mixed feelings.',
+  innocent: 'A completely innocent face. Very convincing.',
+  outside: 'Out wandering. Tap for a brief status. Your cat returns on its own schedule.',
+  'door-out': 'Scratching to go outside. Press and release to open the door.',
+  'door-in': 'Back from an adventure. Press and release to let your cat in.',
   'playing-together': 'Playing with another cat. You have been temporarily excused.',
   squabbling: 'Play got a little too exciting. A brief disagreement, then some space.',
   jealous: 'That cat got a Churu. This cat noticed. Apparently fairness matters now.',
@@ -99,7 +115,7 @@ export function registerControl(streamDeck, SingletonAction, {
   let updatingHousehold = false;
   let householdAt = lastWall;
   const companyCounts = new Map();
-  const company = entry => [...visible.values()].filter(other => other.action.device?.id === entry.action.device?.id);
+  const company = entry => [...visible.values()].filter(other => other.session.atHome && other.action.device?.id === entry.action.device?.id);
   function cancelPair(entry) {
     const partner = entries.get(entry.social.pair?.partnerId);
     entry.social = cancelSocialPair(entry.social);
@@ -111,7 +127,14 @@ export function registerControl(streamDeck, SingletonAction, {
     updatingHousehold = true;
     try {
       companyCounts.clear();
+      const candidates = new Map();
+      for (const entry of visible.values()) if (entry.session.atHome && !entry.social.pair && (entry.session.adventures.mischief || entry.session.adventureEligible)) {
+        const device = entry.action.device?.id, current = candidates.get(device);
+        if (!current || entry.session.adventures.mischief || (!current.session.adventures.mischief && entry.session.adventures.nextMischiefMs < current.session.adventures.nextMischiefMs)) candidates.set(device, entry);
+      }
+      for (const entry of entries.values()) entry.session.setAdventureAccess(candidates.get(entry.action.device?.id) === entry, Boolean(entry.social.pair), Boolean(entry.social.jealousy));
       for (const entry of visible.values()) {
+        if (!entry.session.atHome) continue;
         const id = entry.action.device?.id;
         companyCounts.set(id, (companyCounts.get(id) || 0) + 1);
       }
@@ -119,14 +142,14 @@ export function registerControl(streamDeck, SingletonAction, {
       resources.advance(time, { paused });
       const base = new Map();
       for (const entry of entries.values()) {
-        const completed = entry.social.completedPlays;
-        entry.social = advanceSocial(entry.social, time, { paused: paused || !entry.visible, companyCount: entry.visible ? companyCounts.get(entry.action.device?.id) : 1 });
-        if (entry.social.completedPlays > completed) entry.session.relieveAttention(SOCIAL_PLAY_ATTENTION_RELIEF);
+        const completed = entry.social.completedPlays, activityKind = entry.social.pair?.kind || 'play';
+        entry.social = advanceSocial(entry.social, time, { paused: paused || !entry.visible || !entry.session.atHome || entry.session.adventureBusy, companyCount: entry.visible ? companyCounts.get(entry.action.device?.id) : 1 });
+        if (entry.social.completedPlays > completed) { entry.session.relieveAttention(SOCIAL_PLAY_ATTENTION_RELIEF); entry.session.rememberCompany(activityKind); }
         if (entry.visible) base.set(entry.action.id, entry.session.frame());
       }
       const eligible = entry => {
         const result = base.get(entry.action.id);
-        return result && !result.routineMode && !entry.session.state.anger && entry.session.state.careStage === 'normal'
+        return result && entry.session.atHome && !entry.session.adventureBusy && !result.adventureMode && !result.biscuitMode && !result.personalityMode && !result.foodExcluded && !result.routineMode && !entry.session.state.anger && entry.session.state.careStage === 'normal'
           && !entry.session.state.treat && !(entry.session.state.tapEffect && entry.session.state.updatedAtMs < entry.session.state.tapEffect.endsAtMs)
           && ['content', 'waiting', 'grumpy', 'zoomies', 'settling'].includes(result.mode);
       };
@@ -136,10 +159,16 @@ export function registerControl(streamDeck, SingletonAction, {
       }
       const ready = [...visible.values()].filter(entry => eligible(entry) && socialPlayReady(entry.social, { mode: base.get(entry.action.id).mode }));
       while (ready.length > 1) {
-        const first = ready.shift(), index = ready.findIndex(other => other.action.device?.id === first.action.device?.id);
+        const first = ready.shift();
+        let index = -1, score = -Infinity;
+        for (let i = 0; i < ready.length; i++) if (ready[i].action.device?.id === first.action.device?.id) {
+          const value = socialPartnerScore(first.social, ready[i].action.id, first.session.habits.sociability);
+          if (value > score) { score = value; index = i; }
+        }
         if (index < 0) continue;
         const second = ready.splice(index, 1)[0];
-        const pair = startSocialPair(first.social, second.social, first.action.id, second.action.id);
+        const pair = startSocialPair(first.social, second.social, first.action.id, second.action.id, { leftHabits: first.session.habits, rightHabits: second.session.habits,
+          energy: (first.session.state.energy + second.session.state.energy) / 2, pressure: Math.max(first.session.state.stimulation, second.session.state.stimulation) });
         first.social = pair.left; second.social = pair.right;
         safely(requestSave(first), first); safely(requestSave(second), second);
       }
@@ -148,7 +177,7 @@ export function registerControl(streamDeck, SingletonAction, {
   }
   function frame(entry) {
     const result = entry.session.frame();
-    const social = socialFrame(entry.social, { mode: result.mode });
+    const social = result.adventureMode || result.biscuitMode || result.personalityMode || result.foodExcluded ? null : socialFrame(entry.social, { mode: result.mode });
     const partner = entries.get(social?.socialPartnerId);
     const display = { ...result, ...social };
     return { ...display, buddyCat: partner?.session.config.cat, socialRole: partner && entry.action.id > partner.action.id ? 'right' : 'left', companyCount: companyCounts.get(entry.action.device?.id) || 1, cat: entry.session.config.cat,
@@ -156,12 +185,13 @@ export function registerControl(streamDeck, SingletonAction, {
       soil: result.companions?.litter.soil,
       phase: entry.session.config.animate ? display.phase : 0.18,
       effectProgress: entry.session.config.animate ? display.effectProgress : result.mode === 'recovering' ? 0.45 : result.mode === 'puking' ? 0.5 : null,
-      holdProgress: entry.press.snapshot.progress };
+      animate: entry.session.config.animate,
+      holdProgress: entry.session.adventures.outside ? 0 : entry.press.snapshot.progress };
   }
 
   function requestRender(entry) {
     if (!entry.visible || disposed) return Promise.resolve();
-    return queueKeyImage(entry, renderer(frame(entry)), { now: monotonic,
+    return queueKeyImage(entry, entry.artwork(frame(entry)), { now: monotonic,
       write: image => entry.action.setImage(image), active: () => entry.visible && !disposed,
       onError: error => report(error, entry) });
   }
@@ -181,7 +211,7 @@ export function registerControl(streamDeck, SingletonAction, {
           energy: result.energy, attentionNeed: result.attentionNeed, stimulation: result.stimulation,
           affection: result.affection, temperament: result.temperament, careStage: result.careStage },
         companions: result.companions, companyCount: result.companyCount,
-        preview: renderer(result), ...(entry.session.message ? { message: entry.session.message } : {}),
+        preview: entry.artwork(result), ...(entry.session.message ? { message: entry.session.message } : {}),
         ...(requestId === undefined ? {} : { requestId }) };
       await streamDeck.ui.sendToPropertyInspector(payload);
     });
@@ -209,8 +239,9 @@ export function registerControl(streamDeck, SingletonAction, {
     if (!entry.visible || disposed) return;
     const time = advanceHousehold();
     cancelPair(entry);
+    const oldTreats = entry.session.state.treatCount;
     entry.session[kind](time);
-    if (kind === 'treat') {
+    if (kind === 'treat' && entry.session.state.treatCount > oldTreats) {
       entry.social = recordSocialTreat(entry.social, { received: true });
       for (const other of company(entry)) if (other !== entry) {
         cancelPair(other);
@@ -235,9 +266,9 @@ export function registerControl(streamDeck, SingletonAction, {
     let social;
     try { social = settings?.social ? restoreSocial(settings.social, time) : createSocial(time); }
     catch { social = createSocial(time); }
-    const entry = { action, session, social, present: true, visible: deviceAvailable(action), image: '', nextImage: null, rendering: null,
+    const entry = { action, session, social, artwork: createButtonRenderer(renderer), present: true, visible: deviceAvailable(action), image: '', nextImage: null, rendering: null,
       savePending: false, saving: null, lastSaveRequestedAt: time, ownWrites: new Set(), lastInteraction: Promise.resolve() };
-    entry.press = createPressController({ onTap: () => interact(entry, 'attention'), onHold: () => interact(entry, 'treat') });
+    entry.press = createPressController({ onTap: () => interact(entry, 'attention'), onHold: () => interact(entry, 'treat'), onChange: value => session.setPressed(value.active) });
     if (session.message) report(new Error(session.message), entry);
     return entry;
   }
@@ -326,6 +357,7 @@ export function registerControl(streamDeck, SingletonAction, {
       checkClock();
       const entry = visible.get(ev.action.id);
       if (!entry || disposed) return;
+      advanceHousehold();
       entry.press.release(monotonic(), 'key');
       await guarded(entry, async () => { await entry.lastInteraction; await requestRender(entry); }, undefined, true);
     }

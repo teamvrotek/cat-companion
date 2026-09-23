@@ -1,5 +1,5 @@
 /**
- * Cat Attention 1.0 is a fictional pet model, not a biological model of cats.
+ * Cat Companion is a fictional pet model, not a biological model of cats.
  * Each key owns immutable state. Retain result.state after every resolve call.
  * Short presses call giveAttention; the UI calls giveTreat once per completed
  * hold. Coat selection is visual and never changes the behavior model.
@@ -183,7 +183,7 @@ function angerFor(level, context, nowMs, period, traits, previous = null) {
     treatHelpUsed: previous?.level === 'attack' ? previous.treatHelpUsed : false, period, variant: context.variant });
 }
 
-function advanceState(state, nowMs, period, demoSpeed, attentionScale = 1) {
+function advanceState(state, nowMs, period, demoSpeed, attentionScale = 1, energyBias = 0) {
   assertState(state);
   assertTime(nowMs);
   assertPeriod(period);
@@ -203,7 +203,7 @@ function advanceState(state, nowMs, period, demoSpeed, attentionScale = 1) {
   const needElapsed = elapsed * demoSpeed * (needTarget > state.attentionNeed ? attentionScale : 1);
   let current = {
     ...state, updatedAtMs: time, demoSpeed,
-    energy: approach(state.energy, clamp(ENERGY_TARGET[state.period] + traits.energyOffset), elapsed * demoSpeed, CAT_TIMING.energyDriftMs),
+    energy: approach(state.energy, clamp(ENERGY_TARGET[state.period] + traits.energyOffset + energyBias), elapsed * demoSpeed, CAT_TIMING.energyDriftMs),
     attentionNeed: approach(state.attentionNeed, needTarget, needElapsed, CAT_TIMING.attentionNeedDriftMs),
     stimulation,
     affection: approach(state.affection, 0, elapsed, CAT_TIMING.affectionDecayMs),
@@ -271,7 +271,7 @@ function cycleStage(elapsedMs, stages, speed) {
   throw new RangeError('Invalid behavior cycle.');
 }
 
-function normalBehavior(state, nowMs, demoSpeed) {
+function normalBehavior(state, nowMs, demoSpeed, habits = {}) {
   const effect = state.tapEffect;
   const effectAge = effect ? Math.max(0, nowMs - effect.startedAtMs) : null;
   const effectDuration = effect ? effect.endsAtMs - effect.startedAtMs : CAT_TIMING.attentionHappyMs;
@@ -286,8 +286,8 @@ function normalBehavior(state, nowMs, demoSpeed) {
     }
     const elapsed = effectAge === null ? nowMs - state.routineStartedAtMs : effectAge - recoveryEnd;
     return cycleStage(Math.max(0, elapsed) * demoSpeed, [
-      { mode: 'asleep', stage: 'day-sleep', durationMs: CAT_TIMING.daySleepMs },
-      { mode: 'sleepy', stage: 'day-drowsy', durationMs: CAT_TIMING.daySleepyMs },
+      { mode: 'asleep', stage: 'day-sleep', durationMs: CAT_TIMING.daySleepMs * (habits.sleepScale ?? 1) },
+      { mode: 'sleepy', stage: 'day-drowsy', durationMs: CAT_TIMING.daySleepyMs * (habits.playScale ?? 1) },
     ], demoSpeed);
   }
   if (state.period === 'evening') {
@@ -300,15 +300,16 @@ function normalBehavior(state, nowMs, demoSpeed) {
   }
   const elapsed = effectAge === null ? nowMs - state.routineStartedAtMs : effectAge - recoveryEnd;
   const stages = [
-    { mode: 'zoomies', stage: 'zoomies', durationMs: CAT_TIMING.nightZoomiesMs },
+    { mode: 'zoomies', stage: 'zoomies', durationMs: CAT_TIMING.nightZoomiesMs * (habits.playScale ?? 1) },
     { mode: 'settling', stage: 'catching-breath', durationMs: CAT_TIMING.nightSettlingMs },
-    { mode: 'asleep', stage: 'night-rest', durationMs: CAT_TIMING.nightSleepMs },
+    { mode: 'asleep', stage: 'night-rest', durationMs: CAT_TIMING.nightSleepMs * (habits.sleepScale ?? 1) },
   ];
   if (effectAge === null && state.routineStartMode === 'asleep') stages.unshift(stages.pop());
   return cycleStage(Math.max(0, elapsed) * demoSpeed, stages, demoSpeed);
 }
 
-function naturalContext(state, nowMs, demoSpeed) {
+const OPTIONAL_INTERACTION_MODES = new Set(['watching', 'stretching', 'stalking', 'grooming', 'settling', 'zoomies']);
+function naturalContext(state, nowMs, demoSpeed, habits = {}, activityMode) {
   if (state.treat) return { variant: state.treat.variant, sourceMode: nowMs < state.treat.mealEndsAtMs ? 'eating'
     : nowMs < state.treat.groomEndsAtMs ? 'grooming' : 'love' };
   if (state.anger) return { variant: state.anger.variant,
@@ -316,10 +317,13 @@ function naturalContext(state, nowMs, demoSpeed) {
   if (state.recoveryContext && state.careStage !== 'normal') {
     return { variant: state.recoveryContext.variant, sourceMode: state.careStage };
   }
-  const routine = normalBehavior(state, nowMs, demoSpeed);
+  const routine = normalBehavior(state, nowMs, demoSpeed, habits);
   if (state.tapEffect && nowMs < state.tapEffect.endsAtMs) {
     return { variant: state.tapEffect.variant, sourceMode: state.tapEffect.sourceMode };
   }
+  if (OPTIONAL_INTERACTION_MODES.has(activityMode)) return {
+    variant: variantForMode(activityMode === 'stalking' ? 'zoomies' : activityMode, state.period, state.energy), sourceMode: activityMode,
+  };
   return { variant: variantForMode(routine.mode, state.period, state.energy), sourceMode: routine.mode };
 }
 
@@ -339,8 +343,8 @@ function pressureBehavior(state) {
 
 const IDLE_GESTURE = Object.freeze({ asleep: 'sleepy-smile', sleepy: 'slow-blink', content: 'slow-blink', waiting: 'headbutt', grumpy: 'side-eye', zoomies: 'pounce', settling: 'groom' });
 
-function resolveBehavior(state, nowMs, demoSpeed) {
-  const context = naturalContext(state, nowMs, demoSpeed);
+function resolveBehavior(state, nowMs, demoSpeed, habits = {}) {
+  const context = naturalContext(state, nowMs, demoSpeed, habits);
   const pressure = pressureBehavior(state);
   const treat = state.treat;
   const inLove = Boolean(treat && nowMs >= treat.groomEndsAtMs);
@@ -388,7 +392,7 @@ function resolveBehavior(state, nowMs, demoSpeed) {
       elapsedMs: nowMs - treat.groomEndsAtMs, nextChangeInMs: treat.loveEndsAtMs - nowMs,
       effectProgress: progress(nowMs, treat.groomEndsAtMs, treat.loveEndsAtMs) };
   }
-  const normal = normalBehavior(state, nowMs, demoSpeed);
+  const normal = normalBehavior(state, nowMs, demoSpeed, habits);
   return { ...base, ...normal, gesture: normal.gesture ?? IDLE_GESTURE[normal.mode] ?? 'slow-blink',
     affectionate: state.affection >= 0.65 && ['happy', 'playfight', 'content'].includes(normal.mode) };
 }
@@ -418,14 +422,14 @@ function touchGesture(context, count, affection, temperament, energy, stimulatio
 }
 
 /** A short press relieves attention need but adds context-dependent stimulation. */
-export function giveAttention(state, nowMs, period, { demoSpeed = 1 } = {}) {
+export function giveAttention(state, nowMs, period, { demoSpeed = 1, habits = {}, activityMode } = {}) {
   const current = advanceState(state, nowMs, period, demoSpeed);
   const time = current.updatedAtMs;
-  const context = naturalContext(current, time, demoSpeed);
+  const context = naturalContext(current, time, demoSpeed, habits, activityMode);
   const traits = getTemperament(current.temperament);
   const gap = current.lastAttentionAtMs === null ? Infinity : Math.max(0, time - current.lastAttentionAtMs);
   const rapidMultiplier = 1 + 0.60 * clamp((4_000 - gap) / 3_000);
-  const stimulation = clamp(current.stimulation + stimulationPerTap(context, current.careStage, current.affection) * traits.sensitivity * rapidMultiplier);
+  const stimulation = clamp(current.stimulation + stimulationPerTap(context, current.careStage, current.affection) * traits.sensitivity * Math.max(.9, Math.min(1.12, habits.touchScale ?? 1)) * rapidMultiplier);
   const careStage = careStageFor(stimulation, current.careStage, time, current.careStageUntilMs);
   const dwellMs = ({ warning: CAT_TIMING.warningDwellMs, enough: CAT_TIMING.enoughDwellMs,
     overstimulated: CAT_TIMING.overstimulatedDwellMs })[careStage] ?? 0;
@@ -456,11 +460,12 @@ export function giveAttention(state, nowMs, period, { demoSpeed = 1 } = {}) {
 }
 
 /** Every completed hold gives a treat. Treats redirect behavior, never erase pressure. */
-export function giveTreat(state, nowMs, period, { demoSpeed = 1 } = {}) {
+export function giveTreat(state, nowMs, period, { demoSpeed = 1, habits = {}, activityMode } = {}) {
   const current = advanceState(state, nowMs, period, demoSpeed);
   const time = current.updatedAtMs;
-  const context = naturalContext(current, time, demoSpeed);
-  const sourceMode = resolveBehavior(current, time, demoSpeed).mode;
+  const context = naturalContext(current, time, demoSpeed, habits, activityMode);
+  const sourceMode = OPTIONAL_INTERACTION_MODES.has(activityMode) && context.sourceMode === activityMode
+    ? activityMode : resolveBehavior(current, time, demoSpeed, habits).mode;
   const traits = getTemperament(current.temperament);
   const mealEndsAtMs = time + CAT_TIMING.eatingMs;
   const groomEndsAtMs = mealEndsAtMs + CAT_TIMING.groomingMs;
@@ -483,11 +488,11 @@ export function giveTreat(state, nowMs, period, { demoSpeed = 1 } = {}) {
  * still visible through overloadWarning while eating or grooming takes priority.
  * Schedule transitions retain care values and active treat deadlines.
  */
-export function resolveCatState(state, nowMs, period, { demoSpeed = 1, attentionScale = 1 } = {}) {
+export function resolveCatState(state, nowMs, period, { demoSpeed = 1, attentionScale = 1, habits = {} } = {}) {
   if (!Number.isFinite(attentionScale) || attentionScale <= 0 || attentionScale > 1) throw new RangeError('Invalid attention scale.');
-  const current = advanceState(state, nowMs, period, demoSpeed, attentionScale);
+  const current = advanceState(state, nowMs, period, demoSpeed, attentionScale, Math.max(-.2, Math.min(.2, habits.energyBias || 0)));
   const time = current.updatedAtMs;
-  const behavior = resolveBehavior(current, time, demoSpeed);
+  const behavior = resolveBehavior(current, time, demoSpeed, habits);
   const animationOrigin = behavior.mode === 'attack' ? current.anger.startedAtMs
     : behavior.mode === 'angry' ? current.anger.level === 'attack' ? current.anger.attackUntilMs
       : current.anger.startedAtMs + CAT_TIMING.overstimulatedDwellMs : current.createdAtMs;

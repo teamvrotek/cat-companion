@@ -1,6 +1,9 @@
+import { createPersonality, restorePersonality, effectivePersonality, advancePersonality, rememberInteraction, rememberCompany, personalityFrame } from './lib/personality.js';
 import { createCatState, getPeriod, giveAttention, giveTreat, resolveCatState, setTemperament, TEMPERAMENTS, CAT_TIMING } from './lib/behavior.js';
 import { MODES } from './lib/renderer.js';
 import { CARE_SCHEMA, isRecord, normalizeConfig } from './config.js';
+import { createAdventures, restoreAdventures, advanceAdventures, interactAdventure, adventureFrame, isHome, adventureBusy } from './lib/adventures.js';
+import { createBiscuits, restoreBiscuits, advanceBiscuits, offerBiscuits, biscuitFrame } from './lib/biscuits.js';
 import { LITTER_CAPACITY } from './lib/care-constants.js';
 import { ROUTINE_SCHEMA, ROUTINE_TIMING, createRoutine, restoreRoutine, validateRoutine, advanceRoutine,
   setRoutineCompanions, setRoutineAppetite, recordRoutineTreat, refillRoutine, cleanRoutineLitter, routineFrame, routinePriority, projectRoutineSupplies, inviteRoutineMeal } from './lib/routine.js';
@@ -31,25 +34,26 @@ function nextBoundary(afterMs, schedule) {
       const candidate = new Date(date.getFullYear(), date.getMonth(), date.getDate() + day, hour, minute).getTime();
       if (candidate > afterMs && candidate < next) next = candidate;
     }
+    if (next !== Infinity) break;
   }
   return next;
 }
 
 /** Exact recent schedule boundaries, with at most two days of work after a long absence. */
-export function advanceCare(state, nowMs, config, attentionScale = 1) {
+export function advanceCare(state, nowMs, config, attentionScale = 1, habits = {}) {
   const end = Math.max(nowMs, state.updatedAtMs);
   let current = state;
   if (end - current.updatedAtMs > 48 * 60 * 60_000) {
     const recent = end - 48 * 60 * 60_000;
-    current = resolveCatState(current, recent, current.period, { attentionScale }).state;
-    current = resolveCatState(current, recent, periodAt(recent, config.schedule), { attentionScale }).state;
+    current = resolveCatState(current, recent, current.period, { attentionScale, habits }).state;
+    current = resolveCatState(current, recent, periodAt(recent, config.schedule), { attentionScale, habits }).state;
   }
   let boundary = nextBoundary(current.updatedAtMs, config.schedule);
   for (let count = 0; boundary <= end && count < 12; count++) {
-    current = resolveCatState(current, boundary, periodAt(boundary, config.schedule), { attentionScale }).state;
+    current = resolveCatState(current, boundary, periodAt(boundary, config.schedule), { attentionScale, habits }).state;
     boundary = nextBoundary(boundary, config.schedule);
   }
-  return resolveCatState(current, end, periodAt(end, config.schedule), { attentionScale });
+  return resolveCatState(current, end, periodAt(end, config.schedule), { attentionScale, habits });
 }
 
 /** Whitelist persisted care, checking every timestamp, meter, counter and effect enum. */
@@ -157,11 +161,21 @@ function nextCareEvent(state, schedule) {
   return Math.min(...candidates.filter(value => Number.isFinite(value) && value > after));
 }
 
-export function createSession(settings = {}, nowMs = Date.now(), { routineSeed } = {}) {
-  let companyScale = 1, allowLitter = true;
+export function createSession(settings = {}, nowMs = Date.now(), { routineSeed, adventureSeed, biscuitSeed, personalitySeed } = {}) {
+  let companyScale = 1, allowLitter = true, adventureAllowed = true, sociallyBusy = false, sociallyUnsettled = false, pressed = false, foodExcluded = false;
   const normalized = normalizeConfig(settings);
   let config = normalized.config;
   let message = normalized.issues.join(' ');
+  let adventures;
+  try { adventures = settings.adventures ? restoreAdventures(settings.adventures, nowMs) : createAdventures(nowMs, adventureSeed); }
+  catch { adventures = createAdventures(nowMs, adventureSeed); message = [message, 'Saved adventures were repaired. Cat care was preserved.'].filter(Boolean).join(' '); }
+  let biscuits;
+  try { biscuits = settings.biscuits ? restoreBiscuits(settings.biscuits, nowMs) : createBiscuits(nowMs, biscuitSeed); }
+  catch { biscuits = createBiscuits(nowMs, biscuitSeed); message = [message, 'Saved biscuit routine was repaired. Cat care was preserved.'].filter(Boolean).join(' '); }
+  let personality;
+  try { personality = settings.personality ? restorePersonality(settings.personality, nowMs) : createPersonality(nowMs, personalitySeed); }
+  catch { personality = createPersonality(nowMs, personalitySeed); message = [message, 'Saved personality was repaired. Cat care was preserved.'].filter(Boolean).join(' '); }
+  const habits = () => effectivePersonality(personality, config.temperament);
   let state;
   if (isRecord(settings) && Object.hasOwn(settings, 'care')) {
     try { state = restoreCare(settings.care, nowMs); }
@@ -172,7 +186,9 @@ export function createSession(settings = {}, nowMs = Date.now(), { routineSeed }
       message = 'Saved care was repaired for this key. Valid attention and treat counts were kept.';
     }
   } else state = createCatState(nowMs, periodAt(nowMs, config.schedule), { temperament: config.temperament });
-  state = advanceCare(state, nowMs, config, companyScale).state;
+  const savedNeed = state.attentionNeed;
+  state = advanceCare(state, nowMs, config, companyScale, habits()).state;
+  if (!isHome(adventures)) state = Object.freeze({ ...state, attentionNeed: Math.min(savedNeed, state.attentionNeed) });
   if (state.temperament !== config.temperament) state = setTemperament(state, config.temperament, nowMs);
   let routine;
   const freshRoutine = now => createRoutine(now, periodAt(now, config.schedule), { appetite: config.appetite, ...(routineSeed === undefined ? {} : { seed: routineSeed }) });
@@ -181,49 +197,125 @@ export function createSession(settings = {}, nowMs = Date.now(), { routineSeed }
     catch { routine = freshRoutine(nowMs); message = [message, 'Saved household routines were repaired for this key. Cat care and counts were preserved.'].filter(Boolean).join(' '); }
   } else routine = freshRoutine(nowMs);
   routine = setRoutineAppetite(routine, config.appetite);
+  let careFrame, careFrameState, careFrameHabits, careFrameScale;
+  const currentCareFrame = () => {
+    const profile = habits();
+    if (careFrameState !== state || careFrameHabits !== profile || careFrameScale !== companyScale) {
+      careFrame = resolveCatState(state, state.updatedAtMs, state.period, { attentionScale: companyScale, habits: profile });
+      careFrameState = state; careFrameHabits = profile; careFrameScale = companyScale;
+    }
+    return careFrame;
+  };
+  const options = () => ({ ...routineOptions(state, allowLitter), blocked: routineBlocked(state) || Boolean(adventures.mischief) });
+  const eligible = () => !routine.activity && !routineBlocked(state) && !routinePriority(routine, routineOptions(state, allowLitter))
+    && !sociallyBusy && !foodExcluded && ['content', 'waiting', 'grumpy', 'zoomies', 'settling'].includes(currentCareFrame().mode);
+  const canShowAdventure = () => !routine.activity && !state.anger && state.careStage === 'normal'
+    && !(state.treat && state.updatedAtMs < state.treat.loveEndsAtMs)
+    && !routinePriority(routine, routineOptions(state, allowLitter));
+  const canContinueMischief = () => canShowAdventure() && !routineBlocked(state) && !sociallyBusy && !foodExcluded;
+  const adventureInputAllowed = () => adventures.outside?.kind === 'waiting-out' ? canShowAdventure() : eligible();
+  const biscuitOptions = result => {
+    const safe = isHome(adventures) && !adventureFrame(adventures) && !routine.activity && !routineBlocked(state)
+      && !routinePriority(routine, routineOptions(state, allowLitter)) && !routineFrame(routine, options()).routineMode
+      && !sociallyBusy && !sociallyUnsettled && !foodExcluded && state.attentionNeed < .60 && state.stimulation < .34
+      && ['content', 'sleepy', 'settling', 'asleep', 'zoomies'].includes(result.mode);
+    return { safe, relaxed: safe && ['content', 'sleepy', 'settling'].includes(result.mode),
+      period: state.period, temperament: state.temperament, affection: state.affection, held: pressed };
+  };
   const frameFrom = result => {
-    const overlay = routineFrame(routine, routineOptions(state, allowLitter));
-    return { ...result, ...overlay, ...(overlay.routineMode ? { phase: (routine.clockMs % 3_000) / 3_000 } : {}) };
+    const overlay = routineFrame(routine, options());
+    const adventure = adventureFrame(adventures);
+    const canShow = canShowAdventure();
+    return personalityFrame(personality, { ...result, ...overlay, ...(overlay.routineMode ? { phase: (routine.clockMs % 3_000) / 3_000 } : {}),
+      ...(biscuits.active && biscuitOptions(result).safe ? biscuitFrame(biscuits) : {}),
+      ...(foodExcluded && canShow && isHome(adventures) ? { mode: 'food-sulk', foodExcluded: true } : {}),
+      ...(adventure && (!isHome(adventures) || canShow) ? adventure : {}) }, config);
+  };
+
+  // Keep only the current result. Reference changes also invalidate a replayed
+  // checkpoint, supply projection or configuration change at the same timestamp.
+  let frameInputs, cachedFrame, settledInputs, settledPaused;
+  const inputs = () => [state, routine, adventures, biscuits, personality, config, companyScale,
+    allowLitter, adventureAllowed, sociallyBusy, sociallyUnsettled, pressed, foodExcluded];
+  const sameInputs = (left, right) => left && left.every((value, index) => value === right[index]);
+  const settledFrame = paused => {
+    settledInputs = inputs(); settledPaused = paused;
+    return session.frame();
   };
 
   const session = {
-    checkpoint() { return { config, state, routine, message }; },
-    restoreCheckpoint(snapshot) { ({ config, state, routine, message } = snapshot); },
-    projectSupplies(supplies) { routine = projectRoutineSupplies(routine, supplies); },
+    checkpoint() { return { config, state, routine, adventures, biscuits, personality, message }; },
+    restoreCheckpoint(snapshot) { ({ config, state, routine, adventures, biscuits, personality, message } = snapshot); },
+    projectSupplies(supplies = {}) {
+      if ((supplies.foodLevel === undefined || supplies.foodLevel === routine.food.level)
+        && (supplies.foodEmptyForMs === undefined || supplies.foodEmptyForMs === routine.food.emptyForMs)
+        && (supplies.litterSoil === undefined || supplies.litterSoil === routine.litter.soil)) return;
+      routine = projectRoutineSupplies(routine, supplies);
+    },
     setLitterAccess(value) { allowLitter = Boolean(value); },
     setCompanyScale(value) { companyScale = Math.max(0.5, Math.min(1, Number(value) || 1)); },
     relieveAttention(amount) { state = Object.freeze({ ...state, attentionNeed: Math.max(0, state.attentionNeed - Math.max(0, amount)) }); },
+    setAdventureAccess(value, busy = false, unsettled = false) { adventureAllowed = Boolean(value); sociallyBusy = Boolean(busy); sociallyUnsettled = Boolean(unsettled); },
+    setPressed(value) { pressed = Boolean(value); },
+    setFoodExcluded(value) { foodExcluded = Boolean(value); },
+    get atHome() { return isHome(adventures); },
+    get adventureBusy() { return adventureBusy(adventures); },
+    get adventureEligible() { return eligible(); },
+    get adventures() { return adventures; },
+    get biscuits() { return biscuits; },
+    get personality() { return personality; },
+    get habits() { return habits(); },
+    rememberCompany(kind) { personality = rememberCompany(personality, kind); },
     get config() { return config; },
     get state() { return state; },
     get routine() { return routine; },
     get message() { return message; },
     /** Read the accounted state without moving care or shared resource clocks. */
-    frame() { return frameFrom(resolveCatState(state, state.updatedAtMs, state.period, { attentionScale: companyScale })); },
+    frame() {
+      const current = inputs();
+      if (!sameInputs(frameInputs, current)) { cachedFrame = frameFrom(currentCareFrame()); frameInputs = current; }
+      return cachedFrame;
+    },
     advance(now, { paused = false } = {}) {
       if (!Number.isFinite(now) || now < 0) throw new RangeError('Cat time must be a finite, non-negative timestamp.');
+      if (now === state.updatedAtMs && now === routine.updatedAtMs && settledPaused === paused
+        && sameInputs(settledInputs, inputs())) return session.frame();
+      const wasAway = !isHome(adventures);
+      adventures = advanceAdventures(adventures, now, { outdoor: config.outdoor, paused, held: pressed, eligible: eligible(), continueMischief: canContinueMischief(), doorAvailable: canShowAdventure(), allowMischief: adventureAllowed, needsAttention: state.attentionNeed >= .45 || personality.boredom >= .65, habits: habits() });
+      if (wasAway || !isHome(adventures)) {
+        if (now < state.updatedAtMs) state = restoreCare({ schema: CARE_SCHEMA, state }, now);
+        const attentionNeed = state.attentionNeed;
+        state = advanceCare(state, now, config, companyScale, habits()).state;
+        state = Object.freeze({ ...state, attentionNeed: Math.min(attentionNeed, state.attentionNeed) });
+        routine = Object.freeze({ ...routine, updatedAtMs: now });
+        biscuits = advanceBiscuits(biscuits, now, { paused, safe: false });
+        personality = advancePersonality(personality, now, { paused, held: pressed, home: false, mode: 'outside', temperament: config.temperament });
+        return settledFrame(paused);
+      }
+      if (adventures.mischief && routinePriority(routine, routineOptions(state, allowLitter))) adventures = { ...adventures, mischief: null, nextMischiefMs: 60 * 60_000 };
       // A backwards wall-clock correction shifts remaining care deadlines once.
       // The routine's negative gap pauses this update, then its active clock
       // resumes normally on the next tick instead of waiting for wall time.
       if (now < state.updatedAtMs) state = restoreCare({ schema: CARE_SCHEMA, state }, now);
-      let result = advanceCare(state, state.updatedAtMs, config, companyScale);
+      let result = advanceCare(state, state.updatedAtMs, config, companyScale, habits());
       state = result.state;
       const settleCare = end => {
-        result = advanceCare(state, end, config, companyScale);
+        result = advanceCare(state, end, config, companyScale, habits());
         state = result.state;
         if (routinePriority(routine, { allowFreshFood: freshFoodAllowed(state), allowLitter }) && (state.treat || state.tapEffect)) {
           // Overfeeding, due litter and fresh food replace remaining treat/love
           // visuals. Anger, stimulation, counters and base mood clocks survive.
           state = Object.freeze({ ...state, treat: null, tapEffect: null });
-          result = advanceCare(state, state.updatedAtMs, config, companyScale);
+          result = advanceCare(state, state.updatedAtMs, config, companyScale, habits());
           state = result.state;
         }
       };
       settleCare(state.updatedAtMs);
       const gap = now - routine.updatedAtMs;
       if (paused || gap < 0 || gap > ROUTINE_TIMING.continuousGapMs || routine.updatedAtMs !== state.updatedAtMs) {
-        result = advanceCare(state, now, config, companyScale);
+        result = advanceCare(state, now, config, companyScale, habits());
         state = result.state;
-        routine = advanceRoutine(routine, now, { ...routineOptions(state, allowLitter), paused: true });
+        routine = advanceRoutine(routine, now, { ...options(), paused: true });
         settleCare(state.updatedAtMs);
       } else {
         // Split only at actual care and schedule events. Frame frequency does not
@@ -240,17 +332,49 @@ export function createSession(settings = {}, nowMs = Date.now(), { routineSeed }
             && routine.food.freshMealAtMs > routine.food.clockMs
             ? routine.updatedAtMs + routine.food.freshMealAtMs - routine.food.clockMs : Infinity;
           const end = Math.min(now, nextCareEvent(state, config.schedule), nextPuke, nextRecovery, nextLitter, nextFresh);
-          routine = advanceRoutine(routine, end, routineOptions(state, allowLitter));
+          routine = advanceRoutine(routine, end, options());
           settleCare(end);
-          routine = advanceRoutine(routine, end, routineOptions(state, allowLitter));
+          routine = advanceRoutine(routine, end, options());
         }
-        routine = advanceRoutine(routine, now, routineOptions(state, allowLitter));
+        routine = advanceRoutine(routine, now, options());
         settleCare(state.updatedAtMs);
       }
-      return frameFrom(result);
+      // Sleep ends an unfinished attempt instead of displaying a paused scene.
+      // Hidden keys and held presses retain their exact saved interaction pose.
+      if (adventures.mischief && !paused && !pressed && ['asleep', 'sleepy'].includes(result.mode)) {
+        adventures = { ...adventures, mischief: null, nextMischiefMs: 60 * 60_000 };
+      }
+      const before = frameFrom(result);
+      const safe = isHome(adventures) && !adventureFrame(adventures) && !routine.activity && !routineBlocked(state)
+        && !routinePriority(routine, options()) && !before.routineMode && !biscuits.active
+        && !sociallyBusy && !sociallyUnsettled && !foodExcluded
+        && ['content', 'waiting', 'grumpy', 'zoomies', 'settling'].includes(result.mode);
+      personality = advancePersonality(personality, now, { paused, held: pressed, safe, mode: before.biscuitMode ? 'biscuits' : before.routineMode ? before.mode : result.mode,
+        period: state.period, temperament: config.temperament, company: companyScale < 1, stressed: Boolean(state.anger) || state.careStage !== 'normal' });
+      biscuits = advanceBiscuits(biscuits, now, { ...biscuitOptions(result), paused });
+      if (biscuits.active && personality.episode) personality = { ...personality, episode: null };
+      return settledFrame(paused);
     },
-    attention(now) { session.advance(now); state = giveAttention(state, now, periodAt(Math.max(now, state.updatedAtMs), config.schedule)); return session.advance(now); },
-    treat(now) { session.advance(now); state = giveTreat(state, now, periodAt(Math.max(now, state.updatedAtMs), config.schedule)); routine = recordRoutineTreat(routine); return session.advance(now); },
+    attention(now) {
+      const shown = session.advance(now);
+      const action = interactAdventure(adventures, 'attention', config.outdoor, adventureInputAllowed(), habits()); adventures = action.state;
+      if (action.consumed) return session.advance(now);
+      state = giveAttention(state, now, periodAt(Math.max(now, state.updatedAtMs), config.schedule), { habits: habits(), activityMode: shown.personalityMode ? shown.mode : undefined });
+      const remembered = rememberInteraction(personality, 'attention', state); personality = remembered.personality;
+      if (remembered.gesture) state = Object.freeze({ ...state, tapEffect: Object.freeze({ ...state.tapEffect, gesture: remembered.gesture, mode: remembered.gesture === 'pounce' ? 'playfight' : 'happy' }) });
+      biscuits = offerBiscuits(biscuits, 'attention', { welcome: !state.anger && state.careStage === 'normal', waitMs: state.tapEffect.endsAtMs - now });
+      return session.advance(now);
+    },
+    treat(now) {
+      const shown = session.advance(now);
+      const action = interactAdventure(adventures, 'treat', config.outdoor, adventureInputAllowed(), habits()); adventures = action.state;
+      if (action.consumed) return session.advance(now);
+      state = giveTreat(state, now, periodAt(Math.max(now, state.updatedAtMs), config.schedule), { habits: habits(), activityMode: shown.personalityMode ? shown.mode : undefined });
+      personality = rememberInteraction(personality, 'treat', state).personality;
+      routine = recordRoutineTreat(routine);
+      biscuits = offerBiscuits(biscuits, 'treat', { welcome: !state.anger && state.careStage === 'normal', waitMs: state.treat.loveEndsAtMs - now });
+      return session.advance(now);
+    },
     setCompanions(companions, now) { session.advance(now); routine = setRoutineCompanions(routine, companions); return session.advance(now); },
     inviteFood(now) { session.advance(now); routine = inviteRoutineMeal(routine); return session.advance(now); },
     refill(now) { session.advance(now); routine = refillRoutine(routine); return session.advance(now); },
@@ -280,10 +404,13 @@ export function createSession(settings = {}, nowMs = Date.now(), { routineSeed }
       const companions = { food: routine.food.active, litter: routine.litter.active };
       state = createCatState(now, periodAt(now, config.schedule), { temperament: config.temperament });
       routine = setRoutineCompanions(freshRoutine(now), companions);
+      adventures = createAdventures(now, adventureSeed);
+      biscuits = createBiscuits(now, biscuitSeed);
+      personality = { ...createPersonality(now, personality.identity), traits: personality.traits };
       message = '';
       return session.advance(now);
     },
-    serialize() { return copy({ ...config, care: { schema: CARE_SCHEMA, state }, routine: { schema: ROUTINE_SCHEMA, state: routine } }); },
+    serialize() { return copy({ ...config, care: { schema: CARE_SCHEMA, state }, routine: { schema: ROUTINE_SCHEMA, state: routine }, adventures: { schema: 1, state: adventures }, biscuits: { schema: 1, state: biscuits }, personality: { schema: 1, state: personality } }); },
   };
   return session;
 }

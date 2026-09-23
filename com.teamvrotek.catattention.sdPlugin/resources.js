@@ -1,4 +1,4 @@
-import { CATS, renderResourceButton } from './lib/renderer.js';
+import { CATS, createResourceRenderer } from './lib/renderer.js';
 import { createPressController } from './lib/press.js';
 import { FOOD_LOW_LEVEL, LITTER_CAPACITY, SHARED_CAT_ID } from './lib/care-constants.js';
 import { LITTER_HOLD_MS, getCleanedOpacity } from './lib/care-feedback.js';
@@ -15,7 +15,7 @@ const HIDDEN_RESOURCE_LIMIT = 128;
 export function registerResources(streamDeck, SingletonAction, { cats, now, monotonic, saveCat, renderCat, statusCat, checkClock, deviceAvailable = () => true }) {
   const entries = new Map();
   const actions = {};
-  const bindings = new Map(), groups = new Map(), invitations = new Map();
+  const bindings = new Map(), groups = new Map(), invitations = new Map(), assignedFood = new Map();
   let advancing = false;
   let disposed = false;
   let cacheSequence = 0;
@@ -28,12 +28,12 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
     return cat?.visible && entry.visible && sameDevice(cat.action, entry.action) ? cat : null;
   };
   const eating = cat => ['bowl-eating', 'bowl-nibble'].includes(cat.session.routine.activity?.kind);
-  const groupKey = entry => `${entry.action.device?.id}:${entry.kind}`;
+  const groupKey = entry => `${entry.action.device?.id}:${entry.kind}${entry.kind === 'food' ? `:${entry.action.id}` : ''}`;
   const sharedGroup = entry => groups.get(groupKey(entry));
   const poolOf = entry => entry.catId === SHARED_CAT_ID ? sharedGroup(entry)?.pool : null;
   const targets = entry => {
     if (!present(entry)) return [];
-    if (entry.catId === SHARED_CAT_ID) return available(entry);
+    if (entry.catId === SHARED_CAT_ID) return entry.kind === 'food' ? available(entry).filter(cat => assignedFood.get(cat.action.id) === poolOf(entry)) : available(entry);
     const cat = cats.get(entry.catId);
     return cat && present(cat) && sameDevice(cat.action, entry.action) ? [cat] : [];
   };
@@ -57,7 +57,8 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
   }
   function loadPool(entry, settings) {
     if (!validPool(settings?.pool)) return;
-    if (!entry.pool || entry.pool.id !== settings.pool.id || settings.pool.revision > entry.pool.revision) entry.pool = { ...settings.pool };
+    const value = { ...settings.pool };
+    if (!entry.pool || entry.pool.id !== value.id || value.revision > entry.pool.revision) entry.pool = value;
   }
   function touch(pool) { pool.revision = Math.min(Number.MAX_SAFE_INTEGER, pool.revision + 1); }
   function binding(cat) {
@@ -88,14 +89,14 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
   }
   function preferred(cat, kind) {
     if ([...entries.values()].some(entry => present(entry) && entry.kind === kind && entry.catId === cat.action.id && sameDevice(entry.action, cat.action))) return null;
-    return groups.get(`${cat.action.device?.id}:${kind}`)?.pool || null;
+    return kind === 'food' ? assignedFood.get(cat.action.id) || null : groups.get(`${cat.action.device?.id}:${kind}`)?.pool || null;
   }
   function routeInvitations() {
     for (const cat of cats.values()) {
       const item = binding(cat), invite = invitations.get(cat.action.id);
-      const group = groups.get(`${cat.action.device?.id}:food`);
+      const group = [...groups.values()].find(group => group.pool === assignedFood.get(cat.action.id));
       if (invite && (!present(cat) || group?.pool !== invite)) invitations.delete(cat.action.id);
-      else if (invite && cat.visible && !eating(cat)) {
+      else if (invite && cat.visible && cat.session.atHome && !eating(cat)) {
         bind(cat, 'food', invite); item.forcedFood = invite;
         cat.session.inviteFood(cat.session.routine.updatedAtMs); invitations.delete(cat.action.id);
       }
@@ -110,6 +111,8 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
     }
   }
   function reserveLitter(active, elapsedMs = 0) {
+    for (const cat of active) if (!cat.session.atHome) cat.session.setLitterAccess(false);
+    active = active.filter(cat => cat.session.atHome);
     const occupied = new Map();
     for (const cat of active) {
       const pool = binding(cat).litter;
@@ -149,7 +152,7 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
           cat.session.advance(Math.max(end, cat.session.routine.updatedAtMs));
           changes.push({ cat, item, checkpoint, consumed: Math.max(0, oldFood - cat.session.routine.food.level), visits: Math.max(0, cat.session.routine.litter.soil - oldSoil) });
         }
-        const foodPools = new Set(changes.map(change => change.item.food).filter(Boolean));
+        const foodPools = new Set(changes.filter(change => change.cat.session.atHome).map(change => change.item.food).filter(Boolean));
         for (const pool of foodPools) {
           const diners = changes.filter(change => change.item.food === pool);
           const requested = diners.reduce((sum, change) => sum + change.consumed, 0);
@@ -213,7 +216,7 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
   }
   function frame(entry) {
     const candidates = targets(entry);
-    const cat = candidates.find(candidate => entry.kind === 'food' ? eating(candidate) && binding(candidate).food === poolOf(entry) : candidate.session.routine.activity?.kind === 'litter' && binding(candidate).litter === poolOf(entry)) || candidates[0];
+    const cat = candidates.find(candidate => candidate.visible && candidate.session.atHome && (entry.kind === 'food' ? eating(candidate) && binding(candidate).food === poolOf(entry) : candidate.session.routine.activity?.kind === 'litter' && binding(candidate).litter === poolOf(entry))) || candidates[0];
     const result = cat?.session.frame();
     const supply = result?.companions?.[entry.kind];
     const pool = poolOf(entry);
@@ -223,6 +226,8 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
     const privateSoil = !pool && ownBinding?.litter ? ownBinding.privateSoil : null;
     return { kind: entry.kind, active: Boolean(cat), cat: cat?.session.config.cat || 'ginger',
       level: pool?.level ?? privateFood?.level ?? supply?.level ?? 1, soil: pool?.soil ?? privateSoil ?? supply?.soil ?? 0, eating: usingPool && supply?.eating || false,
+      diners: candidates.filter(candidate => candidate.visible && candidate.session.atHome && eating(candidate) && binding(candidate).food === pool).map(candidate => { const pose = candidate.session.frame(); return { id: candidate.action.id, cat: candidate.session.config.cat, pose: pose.diningPose, phase: candidate.session.config.animate ? pose.phase : .18 }; }),
+      capacity: entry.kind === 'food' ? 4 : null, diningPose: result?.diningPose, litterPose: result?.litterPose,
       using: usingPool && supply?.using || false, shared: Boolean(pool), catCount: candidates.length, progress: supply?.progress || 0,
       holdProgress: cat ? entry.press?.snapshot.progress || 0 : 0,
       cleaning: Boolean(cat && entry.press?.snapshot.active),
@@ -231,7 +236,8 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
   }
   function render(entry) {
     if (!entry.visible || disposed) return Promise.resolve();
-    return queueKeyImage(entry, renderResourceButton(frame(entry)), {
+    entry.artwork ??= createResourceRenderer();
+    return queueKeyImage(entry, entry.artwork(frame(entry)), {
       now: monotonic, write: image => entry.action.setImage(image), active: () => entry.visible && !disposed, onError: report,
     });
   }
@@ -240,12 +246,13 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
     advance();
     const cat = linked(entry);
     const result = frame(entry);
+    entry.artwork ??= createResourceRenderer();
     const candidates = available(entry).map(candidate => ({ id: candidate.action.id,
       name: candidate.session.config.name || CATS.find(coat => coat.id === candidate.session.config.cat)?.label || 'Cat',
       cat: candidate.session.config.cat }));
     await streamDeck.ui.sendToPropertyInspector({ type: 'status', kind: entry.kind, settings: { catId: entry.catId },
-      cats: candidates, resource: result, linkedName: entry.catId === SHARED_CAT_ID ? `Shared with ${targets(entry).length} cats` : cat?.session.config.name || '',
-      preview: renderResourceButton(result), ...(saved ? { saved: true } : {}), ...(requestId === undefined ? {} : { requestId }) });
+      cats: candidates, resource: result, linkedName: entry.catId === SHARED_CAT_ID ? entry.kind === 'food' ? `${targets(entry).length} / 4 places assigned` : `Shared with ${targets(entry).length} cats` : cat?.session.config.name || '',
+      preview: entry.artwork(result), ...(saved ? { saved: true } : {}), ...(requestId === undefined ? {} : { requestId }) });
   }
   function refresh(time = now()) {
     if (disposed) return;
@@ -275,6 +282,14 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
         if (changed) safe(save(entry));
       }
     }
+    assignedFood.clear();
+    const foodGroups = [...groups.values()].filter(group => group.entries[0].kind === 'food').sort((a,b) => a.entries[0].action.id.localeCompare(b.entries[0].action.id));
+    for (const group of foodGroups) {
+      const privateBowl = cat => [...entries.values()].some(entry => present(entry) && entry.kind === 'food' && entry.catId === cat.action.id && sameDevice(entry.action,cat.action));
+      const roster = available(group.entries[0]).filter(cat => !assignedFood.has(cat.action.id))
+        .sort((a,b) => Number(privateBowl(a))-Number(privateBowl(b)) || a.action.id.localeCompare(b.action.id)).slice(0,4);
+      for (const cat of roster) assignedFood.set(cat.action.id,group.pool);
+    }
     for (const entry of entries.values()) if (present(entry)) {
       const candidates = available(entry);
       if (entry.autoLinked && candidates.length > 1) { entry.catId = ''; entry.autoLinked = false; safe(save(entry)); }
@@ -288,6 +303,7 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
       const item = binding(cat), active = { food: false, litter: false };
       for (const entry of entries.values()) if (present(entry) && targets(entry).includes(cat)) active[entry.kind] = true;
       for (const kind of ['food', 'litter']) bind(cat, kind, present(cat) ? kind === 'food' && item.forcedFood ? item.forcedFood : preferred(cat, kind) : null);
+      cat.session.setFoodExcluded(present(cat) && !active.food && foodGroups.some(group => sameDevice(group.entries[0].action,cat.action)));
       presence.set(cat, active);
     }
     // Reserve the shared box before enabling a due cat's routine. Enabling
@@ -330,8 +346,8 @@ export function registerResources(streamDeck, SingletonAction, { cats, now, mono
         pool.level = 1; pool.emptyForMs = 0; touch(pool);
         for (const candidate of selected) {
           if (binding(candidate).food === pool) candidate.session.projectSupplies({ foodLevel: 1, foodEmptyForMs: 0 });
-          if (low && !eating(candidate)) invitations.set(candidate.action.id, pool);
-          else if (low && binding(candidate).food !== pool) invitations.set(candidate.action.id, pool);
+          if (low && candidate.visible && candidate.session.atHome && !eating(candidate)) invitations.set(candidate.action.id, pool);
+          else if (low && candidate.visible && candidate.session.atHome && binding(candidate).food !== pool) invitations.set(candidate.action.id, pool);
         }
         routeInvitations();
       } else { pool.soil = 0; touch(pool); for (const candidate of selected) if (binding(candidate).litter === pool) candidate.session.projectSupplies({ litterSoil: 0 }); }

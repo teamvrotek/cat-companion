@@ -23,7 +23,7 @@ const freeze = value => {
   return value;
 };
 const clone = state => ({ ...state, pair: state.pair ? { ...state.pair } : null,
-  jealousy: state.jealousy ? { ...state.jealousy } : null });
+  jealousy: state.jealousy ? { ...state.jealousy } : null, relationships: (state.relationships || []).map(item => ({ ...item })) });
 function assertTime(nowMs) {
   if (!finite(nowMs)) throw new RangeError('Social time must be a finite, non-negative timestamp.');
 }
@@ -31,8 +31,10 @@ function draw(state, minimum, maximum) {
   state.seed = (Math.imul(state.seed, 1664525) + 1013904223) >>> 0;
   return minimum + Math.floor(state.seed / 0x100000000 * ((maximum - minimum) / 1_000 + 1)) * 1_000;
 }
-const pairDuration = pair => T.playingMs + (pair.willFight ? T.squabblingMs + T.grumpyMs : 0);
-const aftermath = state => state.pair?.willFight && state.clockMs - state.pair.startedAtMs >= T.playingMs + T.squabblingMs;
+const FRIENDLY_MS = { play: T.playingMs, greeting: 6_000, grooming: 20_000, resting: 30_000 };
+const friendlyDuration = pair => FRIENDLY_MS[pair.kind || 'play'];
+const pairDuration = pair => friendlyDuration(pair) + (pair.willFight ? T.squabblingMs + T.grumpyMs : 0);
+const aftermath = state => state.pair?.willFight && state.clockMs - state.pair.startedAtMs >= friendlyDuration(state.pair) + T.squabblingMs;
 
 /** Return a bounded company benefit, regardless of how many extra cats are present. */
 export function companyAttentionScale(count) {
@@ -43,7 +45,7 @@ export function createSocial(nowMs, { seed = Math.floor(Math.random() * 0x100000
   assertTime(nowMs);
   if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) throw new RangeError('Invalid social seed.');
   const state = { updatedAtMs: nowMs, clockMs: 0, playClockMs: 0, seed, nextPlayAtMs: 0,
-    pair: null, jealousy: null, treatedUntilMs: 0, jealousyCooldownUntilMs: 0, completedPlays: 0 };
+    pair: null, jealousy: null, treatedUntilMs: 0, jealousyCooldownUntilMs: 0, completedPlays: 0, relationships: [] };
   state.nextPlayAtMs = draw(state, T.firstPlayMinMs, T.firstPlayMaxMs);
   return freeze(state);
 }
@@ -63,10 +65,11 @@ export function validateSocial(payload) {
   if (raw.pair !== null) {
     const item = raw.pair;
     if (!record(item) || !identifier(item.partnerId) || !finite(item.startedAtMs) || item.startedAtMs > raw.clockMs
+      || !Object.hasOwn(FRIENDLY_MS, item.kind || 'play') || (item.kind && item.kind !== 'play' && item.willFight)
       || typeof item.willFight !== 'boolean' || typeof item.rewarded !== 'boolean'
       || raw.clockMs - item.startedAtMs >= pairDuration(item)
-      || item.rewarded !== (raw.clockMs - item.startedAtMs >= T.playingMs)) fail();
-    pair = { partnerId: item.partnerId, startedAtMs: item.startedAtMs, willFight: item.willFight, rewarded: item.rewarded };
+      || item.rewarded !== (raw.clockMs - item.startedAtMs >= friendlyDuration(item))) fail();
+    pair = { partnerId: item.partnerId, startedAtMs: item.startedAtMs, willFight: item.willFight, rewarded: item.rewarded, ...(item.kind ? { kind: item.kind } : {}) };
   }
   if (raw.jealousy !== null) {
     const item = raw.jealousy;
@@ -76,10 +79,14 @@ export function validateSocial(payload) {
       || raw.jealousyCooldownUntilMs < item.endsAtMs) fail();
     jealousy = { sourceId: item.sourceId, triggeredAtMs: item.triggeredAtMs, startsAtMs: item.startsAtMs, endsAtMs: item.endsAtMs };
   }
+  const relationships = raw.relationships ?? [];
+  if (!Array.isArray(relationships) || relationships.length > 24 || new Set(relationships.map(item => item?.id)).size !== relationships.length) fail();
+  for (const item of relationships) if (!record(item) || !identifier(item.id) || !finite(item.familiarity) || item.familiarity > 1
+    || !finite(item.tension) || item.tension > 1 || !finite(item.lastAtMs) || item.lastAtMs > raw.clockMs) fail();
   return freeze({ updatedAtMs: raw.updatedAtMs, clockMs: raw.clockMs, playClockMs: raw.playClockMs,
     seed: raw.seed, nextPlayAtMs: raw.nextPlayAtMs, pair, jealousy,
     treatedUntilMs: raw.treatedUntilMs, jealousyCooldownUntilMs: raw.jealousyCooldownUntilMs,
-    completedPlays: raw.completedPlays });
+    completedPlays: raw.completedPlays, relationships: relationships.map(item => ({ id: item.id, familiarity: item.familiarity, tension: item.tension, lastAtMs: item.lastAtMs })) });
 }
 
 export function serializeSocial(state) {
@@ -103,8 +110,16 @@ export function advanceSocial(input, nowMs, { paused = false, companyCount = 1 }
   if (companyAttentionScale(companyCount) < 1) state.playClockMs += elapsed;
   if (state.pair) {
     const age = state.clockMs - state.pair.startedAtMs;
-    if (age >= T.playingMs && !state.pair.rewarded) {
+    if (age >= friendlyDuration(state.pair) && !state.pair.rewarded) {
       state.pair.rewarded = true;
+      let bond = state.relationships.find(item => item.id === state.pair.partnerId);
+      if (!bond) { bond = { id: state.pair.partnerId, familiarity: 0, tension: 0, lastAtMs: state.clockMs }; state.relationships.push(bond); }
+      const completedAt = state.pair.startedAtMs + friendlyDuration(state.pair);
+      bond.tension = Math.max(0, bond.tension - Math.max(0, completedAt - bond.lastAtMs) / (30 * 60_000));
+      bond.familiarity = Math.min(1, bond.familiarity + .08);
+      bond.tension = state.pair.willFight ? Math.min(1, bond.tension + .2) : Math.max(0, bond.tension - .1);
+      bond.lastAtMs = completedAt;
+      state.relationships.sort((a, b) => b.lastAtMs - a.lastAtMs); state.relationships = state.relationships.slice(0, 24);
       state.completedPlays = Math.min(Number.MAX_SAFE_INTEGER, state.completedPlays + 1);
     }
     if (age >= pairDuration(state.pair)) state.pair = null;
@@ -119,15 +134,22 @@ export function socialPlayReady(state, { mode = 'content', blocked = false } = {
 }
 
 /** Root chooses an eligible same-page pair once, then applies both returned states together. */
-export function startSocialPair(left, right, leftId, rightId) {
+export function startSocialPair(left, right, leftId, rightId, { leftHabits, rightHabits, energy = 1, pressure = 0 } = {}) {
   if (!identifier(leftId) || !identifier(rightId) || leftId === rightId) throw new RangeError('Choose two distinct cats.');
   if (!socialPlayReady(left) || !socialPlayReady(right)) throw new RangeError('Both cats must be ready to play.');
   const a = clone(left), b = clone(right);
   // Combining both seeds keeps the shared outcome identical despite independent clocks.
   const mixed = (Math.imul((left.seed + right.seed) >>> 0, 1664525) + 1013904223) >>> 0;
-  const willFight = mixed / 0x100000000 < 0.2;
+  const bond = left.relationships?.find(item => item.id === rightId);
+  const familiar = bond?.familiarity || 0;
+  const sociability = leftHabits && rightHabits ? (leftHabits.sociability + rightHabits.sociability) / 2 : null;
+  const kindDraw = ((Math.imul(mixed, 1664525) + 1013904223) >>> 0) / 0x100000000;
+  const kind = sociability === null || kindDraw < .65 ? 'play' : energy < .45 ? 'resting'
+    : familiar > .25 && kindDraw > .85 ? 'grooming' : 'greeting';
+  const fightChance = sociability === null ? .2 : Math.max(.08, Math.min(.3, .24 - sociability * .1 - familiar * .05 + pressure * .1 + bondTension(bond, left.clockMs) * .1));
+  const willFight = kind === 'play' && mixed / 0x100000000 < fightChance;
   for (const [state, partnerId] of [[a, rightId], [b, leftId]]) {
-    state.pair = { partnerId, startedAtMs: state.clockMs, willFight, rewarded: false };
+    state.pair = { partnerId, startedAtMs: state.clockMs, willFight, rewarded: false, ...(sociability === null ? {} : { kind }) };
     state.nextPlayAtMs = state.playClockMs + draw(state, T.playMinMs, T.playMaxMs);
   }
   return Object.freeze({ left: freeze(a), right: freeze(b) });
@@ -170,13 +192,29 @@ export function socialFrame(state, { mode, blocked = false } = {}) {
   if (!state.pair) return null;
   const elapsed = state.clockMs - state.pair.startedAtMs;
   const frame = { socialPartnerId: state.pair.partnerId };
-  if (elapsed < T.playingMs) return { ...frame, mode: 'playing-together', socialKind: 'play',
-    phase: elapsed % 1_000 / 1_000, effectProgress: elapsed / T.playingMs };
-  if (state.pair.willFight && elapsed < T.playingMs + T.squabblingMs) return { ...frame,
-    mode: 'squabbling', socialKind: 'squabble', phase: (elapsed - T.playingMs) % 600 / 600,
-    effectProgress: (elapsed - T.playingMs) / T.squabblingMs };
+  const friendlyMs = friendlyDuration(state.pair);
+  if (elapsed < friendlyMs && state.pair.kind && state.pair.kind !== 'play') return { ...frame,
+    mode: ({ greeting: 'greeting', grooming: 'grooming-together', resting: 'resting-together' })[state.pair.kind],
+    socialKind: state.pair.kind, phase: elapsed % 3_000 / 3_000, effectProgress: elapsed / friendlyMs };
+  if (elapsed < friendlyMs) return { ...frame, mode: 'playing-together', socialKind: 'play',
+    phase: elapsed % 1_000 / 1_000, effectProgress: elapsed / friendlyMs };
+  if (state.pair.willFight && elapsed < friendlyMs + T.squabblingMs) return { ...frame,
+    mode: 'squabbling', socialKind: 'squabble', phase: (elapsed - friendlyMs) % 600 / 600,
+    effectProgress: (elapsed - friendlyMs) / T.squabblingMs };
   if (state.pair.willFight) return { ...frame, mode: 'social-grumpy', socialKind: 'grumpy',
-    phase: (elapsed - T.playingMs - T.squabblingMs) % 2_800 / 2_800,
-    effectProgress: (elapsed - T.playingMs - T.squabblingMs) / T.grumpyMs };
+    phase: (elapsed - friendlyMs - T.squabblingMs) % 2_800 / 2_800,
+    effectProgress: (elapsed - friendlyMs - T.squabblingMs) / T.grumpyMs };
   return null;
 }
+
+/** A weighted, stable draw at pair selection; familiarity never excludes another cat. */
+export function socialPartnerScore(state, partnerId, sociability = .5) {
+  let seed = state.seed;
+  for (const char of partnerId) seed = Math.imul(seed ^ char.charCodeAt(0), 16777619) >>> 0;
+  seed = Math.imul(seed ^ (seed >>> 16), 2246822507) >>> 0;
+  const bond = state.relationships?.find(item => item.id === partnerId);
+  const weight = 1 + (bond?.familiarity || 0) * sociability * 2 - bondTension(bond, state.clockMs) * .25;
+  return Math.log((seed + 1) / 0x100000001) / weight;
+}
+
+function bondTension(bond, clock) { return bond ? Math.max(0, bond.tension - (clock - bond.lastAtMs) / (30 * 60_000)) : 0; }
