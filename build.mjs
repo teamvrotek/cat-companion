@@ -17,11 +17,13 @@ const manifestBytes = readFileSync(join(source, 'manifest.json'));
 const manifest = JSON.parse(manifestBytes);
 const { VERSION, CATS, MODES, renderKey } = await import('./com.teamvrotek.catattention.sdPlugin/lib/renderer.js');
 
-if (manifest.Version !== '2.0' || VERSION !== '2.0') throw new Error('Cat Companion must remain version 2.0.');
+const version = manifest.Version;
+if (!/^\d+\.\d+$/.test(version)) throw new Error(`Use a two-part release version in the manifest, not ${version}.`);
+if (VERSION !== version) throw new Error(`renderer.js VERSION ${VERSION} does not match manifest Version ${version}.`);
 if (manifest.UUID !== uuid) throw new Error('Unexpected plugin identity.');
 if (!existsSync(cli)) throw new Error('Run npm ci before npm run build.');
 for (const path of ['package.json', `${directoryName}/package.json`]) {
-  if (JSON.parse(readFileSync(join(project, path))).version !== '2.0.0') throw new Error(`Unexpected npm version in ${path}.`);
+  if (JSON.parse(readFileSync(join(project, path))).version !== `${version}.0`) throw new Error(`Unexpected npm version in ${path}, expected ${version}.0.`);
 }
 
 const temporary = mkdtempSync(join(tmpdir(), 'cat-companion-build-'));
@@ -113,12 +115,12 @@ try {
   run(process.execPath, ['--input-type=module', '-e', "await import('@elgato/streamdeck'); await import('./controller.js'); await import('./config.js'); await import('./session.js');"], extractedPlugin);
   const schemaPlugin = join(temporary, 'schema', directoryName);
   cpSync(extractedPlugin, schemaPlugin, { recursive: true });
-  writeFileSync(join(schemaPlugin, 'manifest.json'), JSON.stringify({ ...manifest, Version: '2.0.0.0' }, null, 2) + '\n');
+  writeFileSync(join(schemaPlugin, 'manifest.json'), JSON.stringify({ ...manifest, Version: `${version}.0.0` }, null, 2) + '\n');
   runCli(['validate', schemaPlugin, '--no-update-check']);
 
   const installer = Buffer.from(zipSync(entries, { level: 6 }));
   const shippedManifest = unzipSync(installer)[manifestEntry];
-  if (!Buffer.from(shippedManifest).equals(manifestBytes)) throw new Error('Final installer did not preserve the exact 2.0 manifest.');
+  if (!Buffer.from(shippedManifest).equals(manifestBytes)) throw new Error(`Final installer did not preserve the exact ${version} manifest.`);
   if (!readFileSync(join(source, 'manifest.json')).equals(manifestBytes)) throw new Error('Source manifest changed during the build.');
   mkdirSync(release, { recursive: true });
   const output = join(release, `${uuid}.streamDeckPlugin`);
@@ -128,7 +130,7 @@ try {
   const checksum = createHash('sha256').update(installer).digest('hex');
   writeFileSync(`${output}.sha256`, `${checksum}  ${basename(output)}\n`);
   console.log(`Verified ${count} packaged files and ${CATS.length * MODES.length} cat frames.`);
-  console.log(`Built ${relative(project, output)} with exact Version 2.0.`);
+  console.log(`Built ${relative(project, output)} with exact Version ${version}.`);
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

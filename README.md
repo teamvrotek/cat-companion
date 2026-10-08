@@ -4,13 +4,13 @@
 
 <h1 align="center">Cat Companion</h1>
 
-<p align="center"><strong>Version 2.0</strong></p>
+<p align="center"><strong>Version 2.1</strong></p>
 
 Your Stream Deck has a cat now. It naps, makes biscuits and slowly pushes your belongings towards an edge while maintaining eye contact. A little like a Tamagotchi, with whiskers, personal opinions and no intention of becoming more useful.
 
 Press for attention or hold and release to give a treat. Choose from six coats and four temperaments, name your cat and set its sleep schedule. Each cat develops its own little habits and reactions. Add optional Food bowl and Litter box keys to take on the catering and cleaning, or allow outdoor trips with a cat flap or a door you open yourself. Get more cats to keep each other company, feel less bored and demand a little less attention from you. They can play, groom each other, squabble and keep a suspiciously accurate count of who got a treat. Everything stays on your device.
 
-Requires **Stream Deck 6.9+**, **macOS 13+** or **Windows 11 (64-bit)**. Native Windows testing is still pending.
+Requires **Stream Deck 6.9+**, **macOS 13+** or **Windows 10 or later (64-bit)**. Native Windows testing is still pending.
 
 If you find this useful, follow @teamvrotek on [GitHub](https://github.com/teamvrotek) or [Instagram](https://www.instagram.com/teamvrotek/). Your support helps us feel more special, thank you.
 

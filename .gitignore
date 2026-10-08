@@ -25,6 +25,4 @@ tests/
 output/
 tmp/
 marketplace/
-Release/
-*.streamDeckPlugin
 coverage/

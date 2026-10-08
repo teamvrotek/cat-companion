@@ -1,7 +1,7 @@
 // Original layered SVG artwork. Every coat uses the same expressive face rig.
 import { LITTER_CAPACITY } from "./care-constants.js";
 
-export const VERSION = "2.0";
+export const VERSION = "2.1";
 export const CATS = Object.freeze([
     { id: "ginger", label: "Ginger tabby" },
     { id: "brown-tabby", label: "Brown tabby" },
